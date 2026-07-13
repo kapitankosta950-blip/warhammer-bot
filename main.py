@@ -72,6 +72,9 @@ conversations: dict[int, list] = {}
 # Per-user language preference: { user_id: 'uk' | 'en' | 'ru' }
 user_languages: dict[int, str] = {}
 
+# Per-user custom donation state: { user_id: bool }
+awaiting_donation: dict[int, bool] = {}
+
 # Localized response instructions for Gemini system prompt
 LANG_INSTRUCTIONS = {
     "uk": "Always reply in Ukrainian.",
@@ -88,12 +91,19 @@ STRINGS = {
             "фракції, персонажі, поради до гри тощо.\n\n"
             "Просто пиши повідомлення і ми поспілкуємось.\n"
             "Використовуй /clear, щоб стерти нашу історію.\n"
+            "Використовуй /suggest, щоб надіслати пропозицію.\n"
             "Використовуй /support, якщо хочеш підтримати мене зірочками. 🌟"
         ),
         "clear": "🧹 Пам'ять очищено. Інквізиція була б задоволена.",
-        "support_desc": "Задонатити 50 зірочок автору бота на підтримку проекту. Абсолютно добровільно!",
+        "support_desc": "Задонатити зірочки автору бота на підтримку проекту.",
         "thanks": "🙏 Дякую, бойовий брате! Твоя щедрість живить Астрономікан. Імператор захищає!",
         "overload": "⏳ Модель зараз перевантажена, спробуй через хвилинку!",
+        "suggest_text": "💡 Маєш ідею чи відгук? Напиши мені анонімно за цим посиланням:",
+        "suggest_btn": "💡 Надіслати пропозицію",
+        "ad": "📣 *Реклама:*\nЗробити сайт легко! @Bober5b все зробить швидко та якісно. 😉\n\n",
+        "choose_amount": "Обери суму донату (Stars 🌟):",
+        "custom_prompt": "✍️ Введи бажану кількість Stars (ціле число від 15 до 1000):",
+        "invalid_amount": "❌ Некоректна сума. Будь ласка, введи ціле число від 15 до 1000.",
     },
     "en": {
         "start": (
@@ -102,12 +112,19 @@ STRINGS = {
             "grimdark universe — factions, characters, tabletop tips, you name it.\n\n"
             "Just type a message and we'll chat.\n"
             "Use /clear to wipe our conversation history.\n"
+            "Use /suggest to send suggestions.\n"
             "Use /support if you want to toss some Stars my way. 🌟"
         ),
         "clear": "🧹 Memory wiped. The Inquisition would approve.",
-        "support_desc": "Toss 50 Telegram Stars to the dev as a thank-you. Totally optional!",
+        "support_desc": "Toss Telegram Stars to the dev as a thank-you.",
         "thanks": "🙏 Thank you, battle-brother! Your generosity fuels the Astronomican. The Emperor protects!",
         "overload": "⏳ Model is currently overloaded, please try again in a minute!",
+        "suggest_text": "💡 Have an idea or feedback? Send an anonymous message here:",
+        "suggest_btn": "💡 Send suggestion",
+        "ad": "📣 *Ad:*\nNeed a website? It's easy! @Bober5b will build everything quickly and professionally. 😉\n\n",
+        "choose_amount": "Choose a donation amount (Stars 🌟):",
+        "custom_prompt": "✍️ Enter the number of Stars you want to donate (between 15 and 1000):",
+        "invalid_amount": "❌ Invalid amount. Please enter a whole number between 15 and 1000.",
     },
     "ru": {
         "start": (
@@ -116,12 +133,19 @@ STRINGS = {
             "фракциях, персонажах, советах по игре и т.д.\n\n"
             "Просто пиши сообщение, и мы пообщаемся.\n"
             "Используй /clear, чтобы очистить нашу историю.\n"
+            "Используй /suggest, чтобы отправить предложение.\n"
             "Используй /support, если хочешь поддержать меня звёздочками. 🌟"
         ),
         "clear": "🧹 Память очищена. Инквизиция одобряет.",
-        "support_desc": "Задонатить 50 звёздочек автору бота на поддержку проекта. Абсолютно добровольно!",
+        "support_desc": "Задонатить звёздочки автору бота на поддержку проекта.",
         "thanks": "🙏 Спасибо, боевой брат! Твоя щедрость питает Астрономикан. Император защищает!",
         "overload": "⏳ Модель сейчас перегружена, попробуй через минутку!",
+        "suggest_text": "💡 Есть идея или отзыв? Напиши мне анонимно по этой ссылке:",
+        "suggest_btn": "💡 Отправить предложение",
+        "ad": "📣 *Реклама:*\nСделать сайт легко! @Bober5b всё сделает быстро и качественно. 😉\n\n",
+        "choose_amount": "Выбери сумму доната (Stars 🌟):",
+        "custom_prompt": "✍️ Введи желаемое количество Stars (целое число от 15 до 1000):",
+        "invalid_amount": "❌ Некорректная сумма. Пожалуйста, введи целое число от 15 до 1000.",
     }
 }
 
@@ -139,9 +163,9 @@ async def ask_gemini(user_id: int, user_text: str) -> str:
         )
     )
 
-    # Cap history length to avoid unbounded growth (keep last 40 turns)
-    if len(history) > 40:
-        history[:] = history[-40:]
+    # Cap history length to avoid unbounded growth (keep last 12 turns for token optimization)
+    if len(history) > 12:
+        history[:] = history[-12:]
 
     user_lang = user_languages.get(user_id, "en")
     lang_inst = LANG_INSTRUCTIONS.get(user_lang, LANG_INSTRUCTIONS["en"])
@@ -229,8 +253,36 @@ async def callback_select_lang(callback: CallbackQuery) -> None:
     conversations.pop(user_id, None)
 
     welcome_text = STRINGS[selected_lang]["start"]
-    await callback.message.answer(welcome_text, parse_mode=ParseMode.MARKDOWN)
+    keyboard = InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(
+                    text=STRINGS[selected_lang]["suggest_btn"],
+                    url="https://t.me/anonaskbot?start=2g6uwo9"
+                )
+            ]
+        ]
+    )
+    await callback.message.answer(welcome_text, reply_markup=keyboard, parse_mode=ParseMode.MARKDOWN)
     await callback.answer()
+
+
+@router.message(Command("suggest"))
+async def cmd_suggest(message: Message) -> None:
+    user_id = message.from_user.id
+    lang = user_languages.get(user_id, "en")
+    
+    keyboard = InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(
+                    text=STRINGS[lang]["suggest_btn"],
+                    url="https://t.me/anonaskbot?start=2g6uwo9"
+                )
+            ]
+        ]
+    )
+    await message.answer(STRINGS[lang]["suggest_text"], reply_markup=keyboard)
 
 
 @router.message(Command("clear"))
@@ -249,15 +301,56 @@ async def cmd_clear(message: Message) -> None:
 async def cmd_support(message: Message) -> None:
     user_id = message.from_user.id
     lang = user_languages.get(user_id, "en")
-    desc = STRINGS[lang]["support_desc"]
+    ad_text = STRINGS[lang]["ad"]
     
-    await message.answer_invoice(
-        title=SUPPORT_TITLE,
-        description=desc,
-        payload="support_donation",
-        currency="XTR",
-        prices=[LabeledPrice(label="Donation", amount=SUPPORT_STARS)],
+    # Send ad first
+    await message.answer(ad_text, parse_mode=ParseMode.MARKDOWN)
+    
+    # Show donation options keyboard
+    keyboard = InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(text="15 🌟", callback_data="donate_15"),
+                InlineKeyboardButton(text="20 🌟", callback_data="donate_20"),
+                InlineKeyboardButton(text="50 🌟", callback_data="donate_50"),
+            ],
+            [
+                InlineKeyboardButton(text="100 🌟", callback_data="donate_100"),
+                InlineKeyboardButton(text="Custom 🌟", callback_data="donate_custom"),
+            ]
+        ]
     )
+    await message.answer(STRINGS[lang]["choose_amount"], reply_markup=keyboard)
+
+
+@router.callback_query(F.data.startswith("donate_"))
+async def callback_select_donation(callback: CallbackQuery) -> None:
+    user_id = callback.from_user.id
+    lang = user_languages.get(user_id, "en")
+    action = callback.data.split("_")[1]
+    
+    if action == "custom":
+        awaiting_donation[user_id] = True
+        await callback.message.answer(STRINGS[lang]["custom_prompt"])
+        await callback.answer()
+        return
+        
+    try:
+        amount = int(action)
+        desc = STRINGS[lang]["support_desc"]
+        
+        await callback.message.answer_invoice(
+            title=SUPPORT_TITLE,
+            description=desc,
+            payload="support_donation",
+            currency="XTR",
+            prices=[LabeledPrice(label="Donation", amount=amount)],
+        )
+    except Exception as exc:
+        log.exception("Failed to send invoice via callback")
+        await callback.message.answer(f"⚠️ Error: {exc}")
+        
+    await callback.answer()
 
 
 @router.pre_checkout_query()
@@ -281,6 +374,37 @@ async def on_successful_payment(message: Message) -> None:
 async def handle_chat(message: Message) -> None:
     user_id = message.from_user.id
     user_text = message.text
+
+    # Check if user is in custom donation input state
+    if awaiting_donation.get(user_id):
+        text = user_text.strip()
+        lang = user_languages.get(user_id, "en")
+        
+        # If user sends a command instead, cancel the donation state and handle it
+        if text.startswith("/"):
+            awaiting_donation[user_id] = False
+            # Let other handlers deal with it
+            return
+
+        try:
+            amount = int(text)
+            if 15 <= amount <= 1000:
+                awaiting_donation[user_id] = False
+                desc = STRINGS[lang]["support_desc"]
+                await message.answer_invoice(
+                    title=SUPPORT_TITLE,
+                    description=desc,
+                    payload="support_donation",
+                    currency="XTR",
+                    prices=[LabeledPrice(label="Donation", amount=amount)],
+                )
+                return
+            else:
+                await message.answer(STRINGS[lang]["invalid_amount"])
+                return
+        except ValueError:
+            await message.answer(STRINGS[lang]["invalid_amount"])
+            return
 
     # Show "typing…" while Gemini thinks
     await message.bot.send_chat_action(chat_id=message.chat.id, action="typing")
