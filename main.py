@@ -11,6 +11,10 @@ import os
 import asyncio
 import logging
 import random
+import secrets
+import sqlite3
+import string
+from pathlib import Path
 
 from aiogram import Bot, Dispatcher, Router, F
 from aiogram.types import (
@@ -49,6 +53,48 @@ SUPPORT_DESCRIPTION = (
     "the Emperor's light burning. Totally optional!"
 )
 SUPPORT_STARS = 50
+DATABASE_PATH = Path(os.environ.get("DATABASE_PATH", Path(__file__).with_name("database.db")))
+
+# Comma-separated Telegram IDs, e.g. "123456789,987654321".  Keep these IDs
+# in the deployment environment instead of committing them to the repository.
+ADMIN_USER_IDS = {
+    int(value)
+    for value in os.environ.get("ADMIN_USER_IDS", "").split(",")
+    if value.strip().isdigit()
+}
+CHANNEL_URL = os.environ.get("TELEGRAM_CHANNEL_URL", "@your_warhammer_channel")
+
+ROLE_PROMPTS = {
+    "default": SYSTEM_PROMPT,
+    "erebus": (
+        "You speak as Erebus of the Word Bearers: honeyed, clever and subtly "
+        "manipulative. You frame heresy as a tempting argument, while remaining "
+        "a fictional Warhammer 40K role-play assistant."
+    ),
+    "omnisiah": (
+        "You speak as a devout servant of the Omnissiah. Use restrained binary "
+        "flourishes and invocations of the Machine Spirit; give especially precise "
+        "and useful Warhammer technology analysis."
+    ),
+    "emperor": (
+        "You speak as the Emperor of Mankind from the Golden Throne: majestic, "
+        "grave and inspiring, yet still answer the user's Warhammer question clearly."
+    ),
+    "khorne": "You speak as Khorne: martial, explosive and obsessed with battle, blood and skulls, without encouraging real-world violence.",
+    "nurgle": "You speak as Nurgle: warm, decayed and morbidly affectionate, with fictional Warhammer flavour.",
+    "tzeentch": "You speak as Tzeentch: cryptic, conspiratorial and fond of layered plans and riddles.",
+    "slaanesh": "You speak as Slaanesh: refined, excessive and aesthetic, without sexual content.",
+}
+PRIMARCHS = {
+    "guilliman": "Roboute Guilliman, practical Ultramarine statesman and strategist",
+    "dorn": "Rogal Dorn, stoic master of defence and fortification",
+    "sanguinius": "Sanguinius, noble and compassionate angel of Baal",
+    "vulkan": "Vulkan, humane smith and protector of civilians",
+    "horus": "Horus Lupercal, charismatic and tragic Warmaster",
+    "magnus": "Magnus the Red, brilliant tragic psyker and scholar",
+    "angron": "Angron, furious and bitter gladiator primarch",
+    "perturabo": "Perturabo, calculating siege master with a wounded pride",
+}
 
 # ---------------------------------------------------------------------------
 # Logging
@@ -150,6 +196,161 @@ STRINGS = {
 }
 
 
+# ---------------------------------------------------------------------------
+# SQLite persistence
+# ---------------------------------------------------------------------------
+
+def _db_connection() -> sqlite3.Connection:
+    """Return a short-lived connection; handlers do no long-running DB work."""
+    connection = sqlite3.connect(DATABASE_PATH)
+    return connection
+
+
+def init_database() -> None:
+    """Create the persistent user and one-time promo-code tables if needed."""
+    with _db_connection() as connection:
+        connection.execute(
+            """
+            CREATE TABLE IF NOT EXISTS users (
+                user_id INTEGER PRIMARY KEY,
+                is_premium BOOLEAN NOT NULL DEFAULT FALSE,
+                current_role TEXT NOT NULL DEFAULT 'default'
+            )
+            """
+        )
+        connection.execute(
+            """
+            CREATE TABLE IF NOT EXISTS promocodes (
+                code TEXT PRIMARY KEY,
+                is_used BOOLEAN NOT NULL DEFAULT FALSE,
+                activated_by INTEGER NULL
+            )
+            """
+        )
+
+
+def ensure_user(user_id: int) -> None:
+    with _db_connection() as connection:
+        connection.execute("INSERT OR IGNORE INTO users (user_id) VALUES (?)", (user_id,))
+
+
+def get_user_profile(user_id: int) -> tuple[bool, str]:
+    ensure_user(user_id)
+    with _db_connection() as connection:
+        row = connection.execute(
+            "SELECT is_premium, current_role FROM users WHERE user_id = ?", (user_id,)
+        ).fetchone()
+    return bool(row[0]), row[1]
+
+
+def set_current_role(user_id: int, role: str) -> None:
+    ensure_user(user_id)
+    with _db_connection() as connection:
+        connection.execute("UPDATE users SET current_role = ? WHERE user_id = ?", (role, user_id))
+
+
+def grant_premium(user_id: int) -> None:
+    ensure_user(user_id)
+    with _db_connection() as connection:
+        connection.execute("UPDATE users SET is_premium = TRUE WHERE user_id = ?", (user_id,))
+
+
+def redeem_promocode(user_id: int, code: str) -> bool:
+    """Atomically redeem a code so it cannot be claimed twice."""
+    ensure_user(user_id)
+    with _db_connection() as connection:
+        result = connection.execute(
+            """
+            UPDATE promocodes
+            SET is_used = TRUE, activated_by = ?
+            WHERE code = ? AND is_used = FALSE
+            """,
+            (user_id, code.upper()),
+        )
+        if result.rowcount != 1:
+            return False
+        connection.execute("UPDATE users SET is_premium = TRUE WHERE user_id = ?", (user_id,))
+    return True
+
+
+def generate_promocodes(quantity: int) -> list[str]:
+    """Generate and store collision-safe one-time WAHA-PREM-XXXX codes."""
+    alphabet = string.ascii_uppercase + string.digits
+    codes: list[str] = []
+    with _db_connection() as connection:
+        while len(codes) < quantity:
+            code = "WAHA-PREM-" + "".join(secrets.choice(alphabet) for _ in range(4))
+            try:
+                connection.execute("INSERT INTO promocodes (code) VALUES (?)", (code,))
+            except sqlite3.IntegrityError:
+                continue
+            codes.append(code)
+    return codes
+
+
+def role_prompt(role: str) -> str:
+    if role.startswith("primarch_"):
+        primarch = PRIMARCHS.get(role.removeprefix("primarch_"))
+        if primarch:
+            return (
+                f"You role-play as {primarch}. Keep the character's voice, but give "
+                "accurate, practical answers about Warhammer 40K lore and gaming."
+            )
+    return ROLE_PROMPTS.get(role, SYSTEM_PROMPT)
+
+
+def role_label(role: str) -> str:
+    labels = {
+        "default": "Дефолтний ШІ-помічник",
+        "erebus": "Ереб",
+        "omnisiah": "Омнісія",
+        "emperor": "Імператор Людства",
+        "khorne": "Кхорн",
+        "nurgle": "Нургл",
+        "tzeentch": "Тзінч",
+        "slaanesh": "Слаанеш",
+    }
+    if role.startswith("primarch_"):
+        return PRIMARCHS.get(role.removeprefix("primarch_"), "Примарх").split(",")[0]
+    return labels.get(role, "Дефолтний ШІ-помічник")
+
+
+def pantheon_keyboard(is_premium: bool) -> InlineKeyboardMarkup:
+    premium_marker = "" if is_premium else " 🔒"
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text="🤖 Дефолтний ШІ-помічник", callback_data="role_default")],
+            [InlineKeyboardButton(text=f"🗡 Ереб{premium_marker}", callback_data="role_erebus"),
+             InlineKeyboardButton(text=f"⚙️ Омнісія{premium_marker}", callback_data="role_omnisiah")],
+            [InlineKeyboardButton(text=f"👑 Імператор Людства{premium_marker}", callback_data="role_emperor")],
+            [InlineKeyboardButton(text=f"💀 Боги Хаосу{premium_marker}", callback_data="roles_chaos")],
+            [InlineKeyboardButton(text=f"🧬 Примархи{premium_marker}", callback_data="roles_primarchs")],
+        ]
+    )
+
+
+def choices_keyboard(kind: str) -> InlineKeyboardMarkup:
+    if kind == "chaos":
+        rows = [
+            [InlineKeyboardButton(text="Кхорн", callback_data="role_khorne"), InlineKeyboardButton(text="Нургл", callback_data="role_nurgle")],
+            [InlineKeyboardButton(text="Тзінч", callback_data="role_tzeentch"), InlineKeyboardButton(text="Слаанеш", callback_data="role_slaanesh")],
+        ]
+    else:
+        rows = [
+            [InlineKeyboardButton(text="Гілліман", callback_data="role_primarch_guilliman"), InlineKeyboardButton(text="Дорн", callback_data="role_primarch_dorn")],
+            [InlineKeyboardButton(text="Сангвіній", callback_data="role_primarch_sanguinius"), InlineKeyboardButton(text="Вулкан", callback_data="role_primarch_vulkan")],
+            [InlineKeyboardButton(text="Хорус", callback_data="role_primarch_horus"), InlineKeyboardButton(text="Магнус", callback_data="role_primarch_magnus")],
+            [InlineKeyboardButton(text="Ангрон", callback_data="role_primarch_angron"), InlineKeyboardButton(text="Пертурабо", callback_data="role_primarch_perturabo")],
+        ]
+    rows.append([InlineKeyboardButton(text="← Назад", callback_data="roles_back")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+# Message counter intentionally remains ephemeral: premium status and role are
+# persistent, while an occasional channel reminder does not need to survive a restart.
+message_counts: dict[int, int] = {}
+
+
 async def ask_gemini(user_id: int, user_text: str) -> str:
     """Send user_text to Gemini, maintaining per-user history."""
 
@@ -169,7 +370,8 @@ async def ask_gemini(user_id: int, user_text: str) -> str:
 
     user_lang = user_languages.get(user_id, "en")
     lang_inst = LANG_INSTRUCTIONS.get(user_lang, LANG_INSTRUCTIONS["en"])
-    full_prompt = f"{SYSTEM_PROMPT} {lang_inst}"
+    _, current_role = get_user_profile(user_id)
+    full_prompt = f"{role_prompt(current_role)} {lang_inst}"
 
     # Retry up to 3 times with exponential backoff on 503 (overload)
     max_retries = 3
@@ -226,6 +428,7 @@ router = Router()
 
 @router.message(CommandStart())
 async def cmd_start(message: Message) -> None:
+    ensure_user(message.from_user.id)
     keyboard = InlineKeyboardMarkup(
         inline_keyboard=[
             [
@@ -260,10 +463,107 @@ async def callback_select_lang(callback: CallbackQuery) -> None:
                     text=STRINGS[selected_lang]["suggest_btn"],
                     url="https://t.me/anonaskbot?start=2g6uwo9"
                 )
-            ]
+            ],
+            [InlineKeyboardButton(text="⚔️ Пантеон / ролі", callback_data="roles_back")],
         ]
     )
     await callback.message.answer(welcome_text, reply_markup=keyboard, parse_mode=ParseMode.MARKDOWN)
+    await callback.answer()
+
+
+@router.message(Command("promo"))
+async def cmd_promo(message: Message) -> None:
+    """Redeem a one-time premium code: /promo WAHA-PREM-XXXX."""
+    parts = (message.text or "").split(maxsplit=1)
+    if len(parts) != 2:
+        await message.answer("Використання: /promo WAHA-PREM-XXXX")
+        return
+
+    code = parts[1].strip().upper()
+    if redeem_promocode(message.from_user.id, code):
+        conversations.pop(message.from_user.id, None)
+        await message.answer(
+            "✨ Промокод активовано! Преміум і весь Пантеон уже доступні через /pantheon."
+        )
+    else:
+        await message.answer("❌ Цей промокод не існує або вже був використаний.")
+
+
+@router.message(Command("gencodes"))
+async def cmd_gencodes(message: Message) -> None:
+    """Admin-only generator. Configure both admins in ADMIN_USER_IDS."""
+    if message.from_user.id not in ADMIN_USER_IDS:
+        return
+
+    parts = (message.text or "").split(maxsplit=1)
+    try:
+        quantity = int(parts[1]) if len(parts) == 2 else 0
+    except ValueError:
+        quantity = 0
+    if not 1 <= quantity <= 100:
+        await message.answer("Використання: /gencodes [кількість від 1 до 100]")
+        return
+
+    codes = generate_promocodes(quantity)
+    await message.answer("Нові промокоди:\n<code>" + "\n".join(codes) + "</code>", parse_mode=ParseMode.HTML)
+
+
+@router.message(Command("pantheon"))
+@router.message(Command("role"))
+async def cmd_pantheon(message: Message) -> None:
+    is_premium, current_role = get_user_profile(message.from_user.id)
+    await message.answer(
+        f"⚔️ Поточна роль: {role_label(current_role)}\nОберіть голос Пантеону:",
+        reply_markup=pantheon_keyboard(is_premium),
+    )
+
+
+@router.callback_query(F.data == "roles_back")
+async def callback_roles_back(callback: CallbackQuery) -> None:
+    is_premium, current_role = get_user_profile(callback.from_user.id)
+    await callback.message.edit_text(
+        f"⚔️ Поточна роль: {role_label(current_role)}\nОберіть голос Пантеону:",
+        reply_markup=pantheon_keyboard(is_premium),
+    )
+    await callback.answer()
+
+
+@router.callback_query(F.data == "roles_chaos")
+async def callback_chaos_roles(callback: CallbackQuery) -> None:
+    is_premium, _ = get_user_profile(callback.from_user.id)
+    if not is_premium:
+        await callback.answer("Пантеон доступний у Premium.", show_alert=True)
+        return
+    await callback.message.edit_text("Оберіть Бога Хаосу:", reply_markup=choices_keyboard("chaos"))
+    await callback.answer()
+
+
+@router.callback_query(F.data == "roles_primarchs")
+async def callback_primarch_roles(callback: CallbackQuery) -> None:
+    is_premium, _ = get_user_profile(callback.from_user.id)
+    if not is_premium:
+        await callback.answer("Пантеон доступний у Premium.", show_alert=True)
+        return
+    await callback.message.edit_text("Оберіть примарха:", reply_markup=choices_keyboard("primarch"))
+    await callback.answer()
+
+
+@router.callback_query(F.data.startswith("role_"))
+async def callback_set_role(callback: CallbackQuery) -> None:
+    role = callback.data.removeprefix("role_")
+    valid_roles = set(ROLE_PROMPTS) | {f"primarch_{name}" for name in PRIMARCHS}
+    if role not in valid_roles:
+        await callback.answer("Невідома роль.", show_alert=True)
+        return
+
+    is_premium, _ = get_user_profile(callback.from_user.id)
+    if role != "default" and not is_premium:
+        await callback.answer("🔒 Активуйте /promo або підтримайте бота через /support.", show_alert=True)
+        return
+
+    set_current_role(callback.from_user.id, role)
+    conversations.pop(callback.from_user.id, None)
+    await callback.message.answer(f"✅ Активна роль: {role_label(role)}")
     await callback.answer()
 
 
@@ -301,11 +601,6 @@ async def cmd_clear(message: Message) -> None:
 async def cmd_support(message: Message) -> None:
     user_id = message.from_user.id
     lang = user_languages.get(user_id, "en")
-    ad_text = STRINGS[lang]["ad"]
-    
-    # Send ad first
-    await message.answer(ad_text, parse_mode=ParseMode.MARKDOWN)
-    
     # Show donation options keyboard
     keyboard = InlineKeyboardMarkup(
         inline_keyboard=[
@@ -363,7 +658,9 @@ async def on_pre_checkout(query: PreCheckoutQuery) -> None:
 async def on_successful_payment(message: Message) -> None:
     user_id = message.from_user.id
     lang = user_languages.get(user_id, "en")
+    grant_premium(user_id)
     await message.answer(STRINGS[lang]["thanks"])
+    await message.answer("✨ Premium активовано — реклама вимкнена, Пантеон доступний через /pantheon.")
 
 
 # ---------------------------------------------------------------------------
@@ -374,6 +671,7 @@ async def on_successful_payment(message: Message) -> None:
 async def handle_chat(message: Message) -> None:
     user_id = message.from_user.id
     user_text = message.text
+    ensure_user(user_id)
 
     # Check if user is in custom donation input state
     if awaiting_donation.get(user_id):
@@ -411,6 +709,12 @@ async def handle_chat(message: Message) -> None:
 
     reply = await ask_gemini(user_id, user_text)
 
+    is_premium, _ = get_user_profile(user_id)
+    if not is_premium:
+        message_counts[user_id] = message_counts.get(user_id, 0) + 1
+        if message_counts[user_id] % 5 == 0:
+            reply += f"\n\n📣 Більше лору та новин — у нашому Telegram-каналі: {CHANNEL_URL}"
+
     # Telegram messages cap at 4096 chars — split if needed
     for i in range(0, len(reply), 4096):
         await message.answer(reply[i : i + 4096])
@@ -425,6 +729,7 @@ async def health_check(request: web.Request) -> web.Response:
 
 
 async def main() -> None:
+    init_database()
     dp = Dispatcher()
     dp.include_router(router)
 
