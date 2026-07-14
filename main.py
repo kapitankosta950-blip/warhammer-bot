@@ -455,7 +455,12 @@ async def callback_select_lang(callback: CallbackQuery) -> None:
     # Clear history on language switch so the bot starts fresh in that language
     conversations.pop(user_id, None)
 
-    welcome_text = STRINGS[selected_lang]["start"]
+    pantheon_hints = {
+        "uk": "⚔️ Обрати роль Пантеону: /pantheon",
+        "en": "⚔️ Choose a Pantheon role: /pantheon",
+        "ru": "⚔️ Выбрать роль Пантеона: /pantheon",
+    }
+    welcome_text = f"{STRINGS[selected_lang]['start']}\n\n{pantheon_hints[selected_lang]}"
     keyboard = InlineKeyboardMarkup(
         inline_keyboard=[
             [
